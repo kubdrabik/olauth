@@ -1,0 +1,22 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python Cache & Build Artifiacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# Local Databases (Crucial for security!)
+*.db
+*.sqlite3
+
+# Environment Variables / Private Keys
+.env
+.env.*

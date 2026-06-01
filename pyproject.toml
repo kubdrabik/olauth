@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "olauth"
+version = "0.1.0-alpha"
+description = "The zero-config, one-liner authentication engine for Python web frameworks."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+# Crucial: These are the external libraries pip will auto-download for your users
+dependencies = [
+    "bcrypt>=4.0.0",
+]
+
+# This tells Hatch exactly where your package source files live
+[tool.hatch.build.targets.wheel]
+packages = ["src/olauth"]
