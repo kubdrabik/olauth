@@ -1,4 +1,4 @@
-# OL-Auth (v0.1.0-alpha)
+# OL-Auth (v0.1.0a1)
 
 OL-Auth is a lightweight, zero-configuration authentication engine designed to eliminate bootstrap friction in Python web applications. By initializing the library with a single line of code, it provisions a local data store, manages password encryption, and serves responsive, system-adaptive **Log in** and **Sign up** interfaces directly into your application.
 
