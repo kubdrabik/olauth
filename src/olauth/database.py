@@ -43,6 +43,16 @@ def detect_dialect(db_url: str | None) -> str:
     return "sqlite"
 
 
+def _collect_driver_errors(module, *names: str) -> tuple[type[BaseException], ...]:
+    """Safely extracts exception subclasses exposed by a database driver module."""
+    errors: list[type[BaseException]] = []
+    for name in names:
+        candidate = getattr(module, name, None)
+        if isinstance(candidate, type) and issubclass(candidate, BaseException):
+            errors.append(candidate)
+    return tuple(errors)
+
+
 class DatabaseManager:
     """Manages database connections, schemas, users, and sessions across SQLite, PostgreSQL, and MySQL."""
 
@@ -53,6 +63,7 @@ class DatabaseManager:
         self._lock = threading.RLock()
         self._driver = None
         self._integrity_errors: tuple[type[BaseException], ...] = (sqlite3.IntegrityError,)
+        self._operational_errors: tuple[type[BaseException], ...] = ()
 
     def close(self) -> None:
         """Closes the active database connection if open."""
@@ -96,6 +107,7 @@ class DatabaseManager:
             self.connection = conn
             self._driver = "sqlite3"
             self._integrity_errors = (sqlite3.IntegrityError,)
+            self._operational_errors = ()
             return
 
         if self.dialect == "postgres":
@@ -111,6 +123,9 @@ class DatabaseManager:
                 self.connection = psycopg.connect(conn_url)
                 self._driver = "psycopg"
                 self._integrity_errors = (psycopg.IntegrityError,)
+                self._operational_errors = _collect_driver_errors(
+                    psycopg, "OperationalError", "InterfaceError"
+                )
                 return
             except ImportError:
                 pass
@@ -121,6 +136,9 @@ class DatabaseManager:
                 self.connection = psycopg2.connect(conn_url)
                 self._driver = "psycopg2"
                 self._integrity_errors = (psycopg2.IntegrityError,)
+                self._operational_errors = _collect_driver_errors(
+                    psycopg2, "OperationalError", "InterfaceError"
+                )
                 return
             except ImportError as exc:
                 raise RuntimeError(
@@ -158,9 +176,37 @@ class DatabaseManager:
             self.connection = pymysql.connect(**connect_kwargs)
             self._driver = "pymysql"
             self._integrity_errors = (pymysql.IntegrityError,)
+            self._operational_errors = _collect_driver_errors(
+                pymysql, "OperationalError", "InterfaceError"
+            )
             return
 
         raise ValueError(f"Unsupported database dialect: {self.dialect}")
+
+    def _reconnect(self) -> None:
+        if self.connection is not None:
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+            self.connection = None
+        self._connect()
+
+    def _is_connection_lost(self) -> bool:
+        if self.connection is None:
+            return True
+        if self.dialect == "postgres":
+            return bool(getattr(self.connection, "closed", 0)) or bool(
+                getattr(self.connection, "broken", False)
+            )
+        if self.dialect == "mysql":
+            return not getattr(self.connection, "open", True)
+        return False
+
+    def _should_reconnect_after_error(self, exc: BaseException) -> bool:
+        return bool(self._operational_errors and isinstance(exc, self._operational_errors)) or (
+            self._is_connection_lost()
+        )
 
     def _ensure_connection(self) -> None:
         if self.connection is None:
@@ -168,13 +214,19 @@ class DatabaseManager:
             return
 
         if self.dialect == "postgres":
-            if getattr(self.connection, "closed", 0):
-                self._connect()
+            if self._is_connection_lost():
+                self._reconnect()
         elif self.dialect == "mysql":
-            if not getattr(self.connection, "open", True):
-                self._connect()
+            if self._is_connection_lost():
+                self._reconnect()
             elif hasattr(self.connection, "ping"):
-                self.connection.ping(reconnect=True)
+                try:
+                    self.connection.ping(reconnect=True)
+                except Exception:
+                    self._reconnect()
+                else:
+                    if self._is_connection_lost():
+                        self._reconnect()
 
     def adapt_sql(self, sql: str) -> str:
         """Adapts '?' SQL placeholders to the active database dialect."""
@@ -259,6 +311,36 @@ class DatabaseManager:
         columns = [desc[0] for desc in cursor.description]
         return dict(zip(columns, row))
 
+    def _run_query_once(
+        self,
+        adapted_sql: str,
+        params: tuple,
+        *,
+        fetchone: bool,
+        fetchall: bool,
+        commit: bool,
+        return_rowcount: bool,
+    ):
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(adapted_sql, params)
+            result = None
+            if fetchone:
+                result = self._row_to_dict(cursor, cursor.fetchone())
+            elif fetchall:
+                rows = cursor.fetchall()
+                result = [self._row_to_dict(cursor, row) for row in rows]
+            elif return_rowcount:
+                result = cursor.rowcount
+            if commit:
+                self.connection.commit()
+            return result
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
     def _execute(
         self,
         sql: str,
@@ -270,27 +352,31 @@ class DatabaseManager:
         return_rowcount: bool = False,
     ):
         adapted = self.adapt_sql(sql)
+        max_attempts = 2 if self.dialect in ("postgres", "mysql") else 1
         with self._lock:
-            self._ensure_connection()
-            cursor = self.connection.cursor()
-            try:
-                cursor.execute(adapted, params)
-                result = None
-                if fetchone:
-                    result = self._row_to_dict(cursor, cursor.fetchone())
-                elif fetchall:
-                    rows = cursor.fetchall()
-                    result = [self._row_to_dict(cursor, row) for row in rows]
-                elif return_rowcount:
-                    result = cursor.rowcount
-                if commit:
-                    self.connection.commit()
-                return result
-            except Exception:
-                self._safe_rollback()
-                raise
-            finally:
-                cursor.close()
+            for attempt in range(max_attempts):
+                self._ensure_connection()
+                try:
+                    return self._run_query_once(
+                        adapted,
+                        params,
+                        fetchone=fetchone,
+                        fetchall=fetchall,
+                        commit=commit,
+                        return_rowcount=return_rowcount,
+                    )
+                except Exception as exc:
+                    should_retry = (
+                        attempt == 0
+                        and max_attempts > 1
+                        and not isinstance(exc, self._integrity_errors)
+                        and self._should_reconnect_after_error(exc)
+                    )
+                    if should_retry:
+                        self._reconnect()
+                        continue
+                    self._safe_rollback()
+                    raise
 
     # --- USER OPERATIONS ---
 
@@ -435,8 +521,8 @@ class DatabaseManager:
             )
         return code
 
-    def verify_user_code(self, email: str, code: str) -> dict | None:
-        """Checks a 6-digit verification code, activates the user on match, and invalidates the code."""
+    def _validate_verification_code(self, email: str, code: str) -> dict | None:
+        """Validates a 6-digit code for email without consuming it, deleting expired rows."""
         if not email or not code:
             return None
         user = self.get_user_by_email(email)
@@ -473,7 +559,23 @@ class DatabaseManager:
         if not hmac.compare_digest(row["code_hash"], expected_hash):
             return None
 
+        return user
+
+    @staticmethod
+    def _public_user_dict(user: dict) -> dict:
+        return {
+            "id": user["id"],
+            "email": user["email"],
+            "created_at": str(user["created_at"]) if user.get("created_at") is not None else None,
+        }
+
+    def verify_user_code(self, email: str, code: str) -> dict | None:
+        """Checks a 6-digit verification code, activates the user on match, and invalidates the code."""
         with self._lock:
+            user = self._validate_verification_code(email, code)
+            if not user:
+                return None
+
             self._execute(
                 "UPDATE users SET is_verified = 1 WHERE id = ?",
                 (user["id"],),
@@ -484,9 +586,30 @@ class DatabaseManager:
                 (user["id"],),
                 commit=True,
             )
+            return self._public_user_dict(user)
 
-        return {
-            "id": user["id"],
-            "email": user["email"],
-            "created_at": str(user["created_at"]) if user.get("created_at") is not None else None,
-        }
+    def reset_user_password(
+        self, email: str, code: str, hashed_password: str
+    ) -> dict | None:
+        """Validates a 6-digit reset code, updates password_hash, consumes code, and revokes sessions."""
+        with self._lock:
+            user = self._validate_verification_code(email, code)
+            if not user:
+                return None
+
+            self._execute(
+                "UPDATE users SET password_hash = ?, is_verified = 1 WHERE id = ?",
+                (hashed_password, user["id"]),
+                commit=True,
+            )
+            self._execute(
+                "DELETE FROM olauth_verifications WHERE user_id = ?",
+                (user["id"],),
+                commit=True,
+            )
+            self._execute(
+                "DELETE FROM olauth_sessions WHERE user_id = ?",
+                (user["id"],),
+                commit=True,
+            )
+            return self._public_user_dict(user)

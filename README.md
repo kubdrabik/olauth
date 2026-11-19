@@ -1,13 +1,13 @@
-# OL-Auth (v1.0.0)
+# OL-Auth (v1.1.0)
 
-OL-Auth is a lightweight, zero-configuration authentication engine for Python web applications. With a single line of code, it provisions your user & session tables, handles password hashing and persistent cookie sessions, protects routes, and serves responsive light/dark **Sign up** and **Log in** pages.
+OL-Auth (short for **One-Line Auth**) is a lightweight, zero-configuration authentication engine for Python web applications. With a single line of code, it provisions your user & session tables, handles password hashing and persistent cookie sessions, protects routes, and serves responsive light/dark **Sign up**, **Log in**, and **Password Reset** pages.
 
 ---
 
 ## ✨ Features
 
-- **Zero-config local dev, easy cloud scaling:** Defaults to SQLite (WAL mode), and switches to **PostgreSQL** or **MySQL** via a standard connection string (`db=` or `OLAUTH_DATABASE_URL`).
-- **Flask & FastAPI out of the box:** Auto-detects the framework and mounts `/signup`, `/login`, and `/logout`.
+- **Zero-config local dev, easy cloud scaling:** Defaults to SQLite (WAL mode), and switches to **PostgreSQL** or **MySQL** via a standard connection string (`db=` or `OLAUTH_DATABASE_URL`) with automatic reconnect-on-drop.
+- **Flask & FastAPI out of the box:** Auto-detects the framework and mounts `/signup`, `/login`, `/logout`, `/verify`, `/forgot-password`, and `/reset-password`.
 - **One-line route protection:** Use `@olauth.login_required` in Flask or `Depends(olauth.login_required)` in FastAPI, and read `olauth.current_user()` anywhere.
 - **Production-minded security defaults:**
   - `bcrypt` password hashing (12 rounds, safe handling for >72-byte passwords) and constant-time login checks.
@@ -148,6 +148,38 @@ When enabled:
 
 ---
 
+## 🔑 Password Reset Flow
+
+`olauth` includes a built-in 6-digit password reset flow on `/forgot-password` and `/reset-password` (linked directly from `/login`):
+
+- `GET/POST /forgot-password`: Accepts an `email`, generates a single-use 6-digit code if the account exists (without revealing whether the email is registered), sends it via `send_verification_code` / SMTP (or prints to the terminal if no email sender is configured), and redirects to `/reset-password`.
+- `GET/POST /reset-password`: Accepts `email`, `code`, and `password`, enforces `min_password_length`, updates `password_hash`, consumes the code, revokes all existing sessions for that user, and logs the user in (when `auto_login_on_signup=True`).
+
+---
+
+## 🎨 Custom Templates
+
+By default, `olauth` serves its built-in light/dark pages with zero configuration. When you want your own HTML pages instead, pass a `template_dir` directory, individual template file overrides, or both:
+
+```python
+# Option 1: Drop any of login.html, signup.html, verify.html,
+# forgot_password.html (or forgot.html), reset_password.html (or reset.html)
+# into a folder — missing files fall back to built-in pages.
+olauth.init(app, template_dir="templates/auth")
+
+# Option 2: Override specific pages individually
+olauth.init(
+    app,
+    login_template="templates/my_login.html",
+    signup_template="templates/my_signup.html",
+)
+```
+
+Custom templates are rendered with Jinja2 when installed (or safe HTML-escaped `{key}` / `{{ key }}` substitution otherwise) and receive these context variables:
+`error`, `email_value`, `next_param`, `switch_url`, `login_url`, `signup_url`, `logout_url`, `verify_url`, `forgot_password_url`, `reset_password_url`, `title`, `heading`, `button_text`, `switch_prompt`, and `switch_action`.
+
+---
+
 ## ⚙️ Configuration Options
 
 All options have safe defaults and can be customized in `olauth.init(...)`:
@@ -158,12 +190,14 @@ All options have safe defaults and can be customized in `olauth.init(...)`:
 | `redirect_to` | `"/"` | Default destination after successful login/signup when `?next=` is absent. |
 | `login_url` | `"/login"` | Route for login and destination when unauthenticated browser requests are redirected. |
 | `verify_url` | `"/verify"` | Route for entering the 6-digit email verification code. |
+| `forgot_password_url` | `"/forgot-password"` | Route for requesting a 6-digit password reset code. |
+| `reset_password_url` | `"/reset-password"` | Route for entering the 6-digit reset code and choosing a new password. |
 | `cookie_name` | `"olauth_session"` | Name of the `HttpOnly` session cookie. |
 | `session_ttl` | `604800` (7 days) | Session lifetime in seconds. |
-| `verification_ttl` | `900` (15 min) | Email verification code lifetime in seconds. |
+| `verification_ttl` | `900` (15 min) | Email verification and password reset code lifetime in seconds. |
 | `cookie_secure` | `None` (auto) | Force `Secure` cookie flag (`True`/`False`), or auto-detect from HTTPS / `X-Forwarded-Proto`. |
-| `auto_login_on_signup` | `True` | Immediately issue a session cookie upon account creation (or verification). |
-| `min_password_length` | `8` | Minimum password length enforced on `/signup`. |
+| `auto_login_on_signup` | `True` | Immediately issue a session cookie upon account creation, verification, or password reset. |
+| `min_password_length` | `8` | Minimum password length enforced on `/signup` and `/reset-password`. |
 | `rate_limit` | `15` | Failed auth attempts per client IP allowed per 60-second sliding window (`0` disables). |
 | `verify_email` | `False` | Set to `"console"` for terminal verification codes during local dev. |
 | `smtp_user` | `None` | SMTP username/sender address (falls back to `OLAUTH_SMTP_USER`). |
@@ -171,6 +205,12 @@ All options have safe defaults and can be customized in `olauth.init(...)`:
 | `smtp_host` | `"smtp.gmail.com"` | SMTP server hostname for built-in email delivery. |
 | `smtp_port` | `465` | SMTP port (`465` uses SSL; other ports use STARTTLS). |
 | `send_verification_code` | `None` | Optional custom callback `(email, code) -> None` overriding the built-in sender. |
+| `template_dir` | `None` | Directory searched for `login.html`, `signup.html`, `verify.html`, `forgot_password.html`, `reset_password.html`. |
+| `login_template` | `None` | Path to a custom HTML template file overriding `/login`. |
+| `signup_template` | `None` | Path to a custom HTML template file overriding `/signup`. |
+| `verify_template` | `None` | Path to a custom HTML template file overriding `/verify`. |
+| `forgot_password_template` | `None` | Path to a custom HTML template file overriding `/forgot-password`. |
+| `reset_password_template` | `None` | Path to a custom HTML template file overriding `/reset-password`. |
 
 ---
 

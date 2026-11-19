@@ -1,17 +1,87 @@
 from contextvars import ContextVar, Token
 from email.message import EmailMessage
 from functools import wraps
+import html
 import inspect
 import os
+import re
 import smtplib
 import ssl
 from urllib.parse import quote
 
 from .crypto import hash_password, verify_password_constant_time
 from .database import DatabaseManager
-from .ui import RateLimiter, validate_credentials, wants_json_response
+from .ui import (
+    RateLimiter,
+    render_auth_page,
+    render_forgot_password_page,
+    render_reset_password_page,
+    render_verify_page,
+    validate_credentials,
+    wants_json_response,
+)
 
 _UNSET = object()
+
+_TEMPLATE_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "login": ("login.html",),
+    "signup": ("signup.html",),
+    "verify": ("verify.html",),
+    "forgot_password": ("forgot_password.html", "forgot.html"),
+    "reset_password": ("reset_password.html", "reset.html"),
+}
+
+_EXPLICIT_TEMPLATE_ATTRS: dict[str, str] = {
+    "login": "login_template",
+    "signup": "signup_template",
+    "verify": "verify_template",
+    "forgot_password": "forgot_password_template",
+    "reset_password": "reset_password_template",
+}
+
+_PAGE_DEFAULTS: dict[str, dict[str, str]] = {
+    "login": {
+        "title": "Log in",
+        "heading": "Log in to your account",
+        "button_text": "Log in",
+        "switch_prompt": "Don't have an account?",
+        "switch_action": "Sign up",
+        "password_autocomplete": "current-password",
+    },
+    "signup": {
+        "title": "Sign up",
+        "heading": "Create an account",
+        "button_text": "Sign up",
+        "switch_prompt": "Already have an account?",
+        "switch_action": "Log in",
+        "password_autocomplete": "new-password",
+    },
+    "verify": {
+        "title": "Verify your email",
+        "heading": "Verify your email",
+        "button_text": "Verify email",
+        "switch_prompt": "Back to",
+        "switch_action": "Log in",
+    },
+    "forgot_password": {
+        "title": "Reset your password",
+        "heading": "Reset your password",
+        "button_text": "Send reset code",
+        "switch_prompt": "Remembered your password?",
+        "switch_action": "Log in",
+    },
+    "reset_password": {
+        "title": "Set a new password",
+        "heading": "Set a new password",
+        "button_text": "Reset password",
+        "switch_prompt": "Back to",
+        "switch_action": "Log in",
+    },
+}
+
+_PLACEHOLDER_RE = re.compile(
+    r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}|\{([a-zA-Z_][a-zA-Z0-9_]*)\}"
+)
 
 
 def _console_verification_sender(to_email: str, code: str) -> None:
@@ -51,6 +121,14 @@ class OLAuth:
         self.signup_url: str = "/signup"
         self.logout_url: str = "/logout"
         self.verify_url: str = "/verify"
+        self.forgot_password_url: str = "/forgot-password"
+        self.reset_password_url: str = "/reset-password"
+        self.template_dir: str | None = None
+        self.login_template: str | None = None
+        self.signup_template: str | None = None
+        self.verify_template: str | None = None
+        self.forgot_password_template: str | None = None
+        self.reset_password_template: str | None = None
         self.cookie_name: str = "olauth_session"
         self.session_ttl: int = 604800
         self.verification_ttl: int = 900
@@ -324,6 +402,211 @@ class OLAuth:
         )
         return 200, verified_user, token, None
 
+    def process_forgot_password(
+        self, email: str | None, client_ip: str
+    ) -> tuple[int, str | None, str | None]:
+        """Issues and sends a 6-digit password reset code without revealing account existence."""
+        rate_key = f"forgot:{client_ip}"
+        if not self.rate_limiter.is_allowed(rate_key):
+            return 429, None, "Too many attempts. Please try again later."
+
+        cleaned_email, _, email_err = validate_credentials(
+            email,
+            "placeholder",
+            min_password_length=1,
+            check_password_strength=False,
+        )
+        if email_err:
+            self.rate_limiter.record_failure(rate_key)
+            return 400, None, "Please enter a valid email address."
+
+        user = self.db.get_user_by_email(cleaned_email)
+        if user:
+            code = self.db.create_verification_code(
+                user["id"], ttl_seconds=self.verification_ttl
+            )
+            sender = self.send_verification_code or _console_verification_sender
+            sender(user["email"], code)
+
+        return 200, cleaned_email, None
+
+    def process_reset_password(
+        self,
+        email: str | None,
+        code: str | None,
+        password: str | None,
+        client_ip: str,
+    ) -> tuple[int, dict | None, str | None, str | None]:
+        """Validates a 6-digit reset code, updates password_hash, and optionally logs the user in."""
+        rate_key = f"reset:{client_ip}"
+        if not self.rate_limiter.is_allowed(rate_key):
+            return 429, None, None, "Too many attempts. Please try again later."
+
+        cleaned_email, raw_password, err = validate_credentials(
+            email,
+            password,
+            min_password_length=self.min_password_length,
+            check_password_strength=True,
+        )
+        if err:
+            self.rate_limiter.record_failure(rate_key)
+            return 400, None, None, err
+
+        cleaned_code = code.strip() if isinstance(code, str) else ""
+        if len(cleaned_code) != 6 or not cleaned_code.isdigit():
+            self.rate_limiter.record_failure(rate_key)
+            return 400, None, None, "Invalid or expired verification code."
+
+        hashed = hash_password(raw_password)
+        reset_user = self.db.reset_user_password(cleaned_email, cleaned_code, hashed)
+        if not reset_user:
+            self.rate_limiter.record_failure(rate_key)
+            return 400, None, None, "Invalid or expired verification code."
+
+        self.rate_limiter.reset(rate_key)
+        self.rate_limiter.reset(f"login:{client_ip}")
+        token = (
+            self.db.create_session(reset_user["id"], ttl_seconds=self.session_ttl)
+            if self.auto_login_on_signup
+            else None
+        )
+        return 200, reset_user, token, None
+
+    def _resolve_explicit_template(self, raw_path: str) -> str:
+        if not os.path.isabs(raw_path) and self.template_dir is not None:
+            candidate = os.path.join(self.template_dir, raw_path)
+            if os.path.isfile(candidate):
+                return candidate
+        return raw_path
+
+    def _resolve_template_path(self, page: str) -> str | None:
+        attr_name = _EXPLICIT_TEMPLATE_ATTRS.get(page)
+        explicit = getattr(self, attr_name, None) if attr_name else None
+        if explicit is not None:
+            resolved = self._resolve_explicit_template(explicit)
+            if not os.path.isfile(resolved):
+                raise FileNotFoundError(f"Template file not found: {resolved}")
+            return resolved
+
+        if self.template_dir is not None:
+            for filename in _TEMPLATE_CANDIDATES.get(page, ()):
+                candidate = os.path.join(self.template_dir, filename)
+                if os.path.isfile(candidate):
+                    return candidate
+        return None
+
+    def _render_template_file(self, template_path: str, ctx: dict) -> str:
+        try:
+            import jinja2  # type: ignore
+        except ImportError:
+            jinja2 = None
+
+        if jinja2 is not None:
+            abs_path = os.path.abspath(template_path)
+            if self.template_dir is not None:
+                abs_dir = os.path.abspath(self.template_dir)
+                try:
+                    in_dir = os.path.commonpath([abs_dir, abs_path]) == abs_dir
+                except ValueError:
+                    in_dir = False
+            else:
+                abs_dir = ""
+                in_dir = False
+
+            search_root = abs_dir if in_dir else os.path.dirname(abs_path)
+            rel_name = os.path.relpath(abs_path, search_root).replace(os.sep, "/")
+            env = jinja2.Environment(
+                loader=jinja2.FileSystemLoader(search_root),
+                autoescape=jinja2.select_autoescape(
+                    ["html", "htm", "xml"], default_for_string=True, default=True
+                ),
+            )
+            return env.get_template(rel_name).render(**ctx)
+
+        with open(template_path, "r", encoding="utf-8") as fh:
+            raw_html = fh.read()
+
+        def _replace(match: re.Match[str]) -> str:
+            key = match.group(1) or match.group(2)
+            if key not in ctx:
+                return match.group(0)
+            val = ctx[key]
+            return "" if val is None else html.escape(str(val), quote=True)
+
+        return _PLACEHOLDER_RE.sub(_replace, raw_html)
+
+    def render_page(self, page: str, **context) -> str:
+        """Renders a custom template if configured, or falls back to the built-in auth page."""
+        defaults = _PAGE_DEFAULTS.get(page, {})
+        next_param = context.get("next_param") or ""
+        email_value = context.get("email_value") or ""
+
+        ctx = {
+            "page": page,
+            "title": defaults.get("title", ""),
+            "heading": defaults.get("heading", ""),
+            "button_text": defaults.get("button_text", ""),
+            "switch_prompt": defaults.get("switch_prompt", ""),
+            "switch_action": defaults.get("switch_action", ""),
+            "password_autocomplete": defaults.get("password_autocomplete", "current-password"),
+            "error": context.get("error") or "",
+            "email_value": email_value,
+            "email": email_value,
+            "next_param": next_param,
+            "next": next_param,
+            "switch_url": context.get("switch_url") or self.login_url,
+            "login_url": self.login_url,
+            "signup_url": self.signup_url,
+            "logout_url": self.logout_url,
+            "verify_url": self.verify_url,
+            "forgot_password_url": (
+                context.get("forgot_password_url")
+                if "forgot_password_url" in context
+                else self.forgot_password_url
+            ),
+            "reset_password_url": context.get("reset_password_url") or self.reset_password_url,
+        }
+        for key, value in context.items():
+            if key not in ctx or value is not None:
+                ctx[key] = value
+
+        template_path = self._resolve_template_path(page)
+        if template_path is not None:
+            return self._render_template_file(template_path, ctx)
+
+        if page in ("login", "signup"):
+            return render_auth_page(
+                title=ctx["title"],
+                heading=ctx["heading"],
+                button_text=ctx["button_text"],
+                switch_prompt=ctx["switch_prompt"],
+                switch_url=ctx["switch_url"],
+                switch_action=ctx["switch_action"],
+                error=ctx["error"],
+                email_value=ctx["email_value"],
+                password_autocomplete=ctx["password_autocomplete"],
+                forgot_password_url=ctx["forgot_password_url"] if page == "login" else None,
+            )
+        if page == "verify":
+            return render_verify_page(
+                email_value=ctx["email_value"],
+                switch_url=ctx["switch_url"],
+                error=ctx["error"],
+            )
+        if page == "forgot_password":
+            return render_forgot_password_page(
+                email_value=ctx["email_value"],
+                switch_url=ctx["switch_url"],
+                error=ctx["error"],
+            )
+        if page == "reset_password":
+            return render_reset_password_page(
+                email_value=ctx["email_value"],
+                switch_url=ctx["switch_url"],
+                error=ctx["error"],
+            )
+        raise ValueError(f"Unknown auth page: {page}")
+
     def init(
         self,
         app,
@@ -332,6 +615,8 @@ class OLAuth:
         redirect_to: str = "/",
         login_url: str = "/login",
         verify_url: str = "/verify",
+        forgot_password_url: str = "/forgot-password",
+        reset_password_url: str = "/reset-password",
         cookie_name: str = "olauth_session",
         session_ttl: int = 604800,
         verification_ttl: int = 900,
@@ -345,17 +630,46 @@ class OLAuth:
         smtp_host: str = "smtp.gmail.com",
         smtp_port: int = 465,
         send_verification_code=None,
+        template_dir: str | os.PathLike | None = None,
+        login_template: str | os.PathLike | None = None,
+        signup_template: str | os.PathLike | None = None,
+        verify_template: str | os.PathLike | None = None,
+        forgot_password_template: str | os.PathLike | None = None,
+        reset_password_template: str | os.PathLike | None = None,
     ) -> None:
         """Discovers the host framework at runtime, initializes storage, and mounts auth routes."""
         self.redirect_to = redirect_to
         self.login_url = login_url
         self.verify_url = verify_url
+        self.forgot_password_url = forgot_password_url
+        self.reset_password_url = reset_password_url
         self.cookie_name = cookie_name
         self.session_ttl = session_ttl
         self.verification_ttl = verification_ttl
         self.cookie_secure = cookie_secure
         self.auto_login_on_signup = auto_login_on_signup
         self.min_password_length = min_password_length
+
+        self.template_dir = os.fspath(template_dir) if template_dir is not None else None
+        if self.template_dir is not None and not os.path.isdir(self.template_dir):
+            raise FileNotFoundError(f"Template directory not found: {self.template_dir}")
+
+        explicit_templates = {
+            "login_template": login_template,
+            "signup_template": signup_template,
+            "verify_template": verify_template,
+            "forgot_password_template": forgot_password_template,
+            "reset_password_template": reset_password_template,
+        }
+        for attr, value in explicit_templates.items():
+            if value is None:
+                setattr(self, attr, None)
+            else:
+                path_str = os.fspath(value)
+                resolved = self._resolve_explicit_template(path_str)
+                if not os.path.isfile(resolved):
+                    raise FileNotFoundError(f"Template file not found: {resolved}")
+                setattr(self, attr, path_str)
 
         if send_verification_code is None:
             resolved_user = smtp_user if smtp_user is not None else os.environ.get("OLAUTH_SMTP_USER")

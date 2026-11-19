@@ -3,8 +3,6 @@ from flask import Blueprint, g, jsonify, make_response, redirect, request
 from .ui import (
     SECURITY_HEADERS,
     is_same_origin_post,
-    render_auth_page,
-    render_verify_page,
     resolve_redirect_target,
     wants_json_response,
     with_safe_next,
@@ -115,16 +113,12 @@ def inject_flask(app, db, core=None):
                         _set_session_cookie(resp, token)
                     return _apply_security_headers(resp)
 
-        html_body = render_auth_page(
-            title="Sign up",
-            heading="Create an account",
-            button_text="Sign up",
-            switch_prompt="Already have an account?",
+        html_body = core.render_page(
+            "signup",
             switch_url=with_safe_next(core.login_url, next_param),
-            switch_action="Log in",
             error=error,
             email_value=email_value,
-            password_autocomplete="new-password",
+            next_param=next_param,
         )
         return _apply_security_headers(make_response(html_body, status_code))
 
@@ -175,16 +169,13 @@ def inject_flask(app, db, core=None):
                         _set_session_cookie(resp, token)
                     return _apply_security_headers(resp)
 
-        html_body = render_auth_page(
-            title="Log in",
-            heading="Log in to your account",
-            button_text="Log in",
-            switch_prompt="Don't have an account?",
+        html_body = core.render_page(
+            "login",
             switch_url=with_safe_next(core.signup_url, next_param),
-            switch_action="Sign up",
+            forgot_password_url=with_safe_next(core.forgot_password_url, next_param),
             error=error,
             email_value=email_value,
-            password_autocomplete="current-password",
+            next_param=next_param,
         )
         return _apply_security_headers(make_response(html_body, status_code))
 
@@ -233,10 +224,111 @@ def inject_flask(app, db, core=None):
                         _set_session_cookie(resp, token)
                     return _apply_security_headers(resp)
 
-        html_body = render_verify_page(
+        html_body = core.render_page(
+            "verify",
             email_value=email_value,
             switch_url=with_safe_next(core.login_url, next_param),
             error=error,
+            next_param=next_param,
+        )
+        return _apply_security_headers(make_response(html_body, status_code))
+
+    @olauth_bp.route(core.forgot_password_url, methods=["GET", "POST"])
+    def forgot_password():
+        next_param = request.args.get("next")
+        error = ""
+        email_value = (request.args.get("email") or "").strip()
+        status_code = 200
+
+        if request.method == "POST":
+            if not is_same_origin_post(request.headers, request.host):
+                msg = "Cross-origin request blocked."
+                if wants_json_response(request.headers):
+                    return _apply_security_headers(make_response(jsonify({"error": msg}), 403))
+                error = msg
+                status_code = 403
+            else:
+                (email,) = _extract_fields("email")
+                email_value = email.strip() if isinstance(email, str) else ""
+                status, cleaned_email, err = core.process_forgot_password(
+                    email, request.remote_addr or "unknown"
+                )
+                if err:
+                    if wants_json_response(request.headers):
+                        return _apply_security_headers(make_response(jsonify({"error": err}), status))
+                    error = err
+                    status_code = status
+                else:
+                    target = with_verify_params(core.reset_password_url, cleaned_email, next_param)
+                    if wants_json_response(request.headers):
+                        return _apply_security_headers(
+                            make_response(
+                                jsonify(
+                                    {
+                                        "message": "If an account exists for that email, a reset code has been sent.",
+                                        "redirect_to": target,
+                                    }
+                                ),
+                                200,
+                            )
+                        )
+                    return _apply_security_headers(make_response(redirect(target, code=302)))
+
+        html_body = core.render_page(
+            "forgot_password",
+            email_value=email_value,
+            switch_url=with_safe_next(core.login_url, next_param),
+            error=error,
+            next_param=next_param,
+        )
+        return _apply_security_headers(make_response(html_body, status_code))
+
+    @olauth_bp.route(core.reset_password_url, methods=["GET", "POST"])
+    def reset_password():
+        next_param = request.args.get("next")
+        error = ""
+        email_value = (request.args.get("email") or "").strip()
+        status_code = 200
+
+        if request.method == "POST":
+            if not is_same_origin_post(request.headers, request.host):
+                msg = "Cross-origin request blocked."
+                if wants_json_response(request.headers):
+                    return _apply_security_headers(make_response(jsonify({"error": msg}), 403))
+                error = msg
+                status_code = 403
+            else:
+                body_email, code, password = _extract_fields("email", "code", "password")
+                email = body_email if body_email else request.args.get("email")
+                email_value = email.strip() if isinstance(email, str) else ""
+                status, user, token, err = core.process_reset_password(
+                    email, code, password, request.remote_addr or "unknown"
+                )
+                if err:
+                    if wants_json_response(request.headers):
+                        return _apply_security_headers(make_response(jsonify({"error": err}), status))
+                    error = err
+                    status_code = status
+                else:
+                    target = (
+                        resolve_redirect_target(next_param, core.redirect_to)
+                        if token
+                        else with_safe_next(core.login_url, next_param)
+                    )
+                    if wants_json_response(request.headers):
+                        resp = make_response(jsonify({"user": user, "redirect_to": target}), 200)
+                    else:
+                        resp = make_response(redirect(target, code=302))
+                    if token:
+                        _set_session_cookie(resp, token)
+                    return _apply_security_headers(resp)
+
+        html_body = core.render_page(
+            "reset_password",
+            email_value=email_value,
+            switch_url=with_safe_next(core.login_url, next_param),
+            error=error,
+            next_param=next_param,
         )
         return _apply_security_headers(make_response(html_body, status_code))
 

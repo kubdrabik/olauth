@@ -1,3 +1,5 @@
+from pathlib import Path
+import tempfile
 import unittest
 
 from fastapi import Depends, FastAPI
@@ -266,6 +268,148 @@ class FlaskEngineTests(unittest.TestCase):
         dash = client.get("/dashboard")
         self.assertEqual(dash.status_code, 200)
         self.assertEqual(dash.data.decode(), "verified:verify@example.com")
+
+    def test_flask_password_reset_flow(self):
+        sent_codes = []
+        app = Flask(__name__)
+        olauth.init(
+            app,
+            db=":memory:",
+            redirect_to="/dashboard",
+            send_verification_code=lambda email, code: sent_codes.append((email, code)),
+        )
+
+        @app.route("/dashboard")
+        @olauth.login_required
+        def dashboard():
+            return f"dashboard:{olauth.current_user()['email']}"
+
+        old_client = app.test_client()
+        self.assertIn(b'href="/forgot-password"', old_client.get("/login").data)
+
+        # Sign up & verify initial user so old_client holds a valid pre-reset session cookie
+        old_client.post(
+            "/signup",
+            data={"email": "resetme@example.com", "password": "oldpassword123"},
+        )
+        signup_code = sent_codes.pop()[1]
+        old_client.post(
+            "/verify?email=resetme@example.com",
+            data={"code": signup_code},
+        )
+        self.assertEqual(old_client.get("/dashboard").status_code, 200)
+
+        reset_client = app.test_client()
+        forgot_page = reset_client.get("/forgot-password")
+        self.assertEqual(forgot_page.status_code, 200)
+        self.assertIn(b"Reset your password", forgot_page.data)
+
+        # Unknown email succeeds without sending a code (no account enumeration)
+        unknown_html = reset_client.post(
+            "/forgot-password",
+            data={"email": "nobody@example.com"},
+        )
+        self.assertEqual(unknown_html.status_code, 302)
+        self.assertIn("/reset-password", unknown_html.headers["Location"])
+        self.assertEqual(len(sent_codes), 0)
+
+        unknown_json = reset_client.post(
+            "/forgot-password",
+            json={"email": "nobody@example.com"},
+            headers={"Accept": "application/json"},
+        )
+        self.assertEqual(unknown_json.status_code, 200)
+        self.assertEqual(len(sent_codes), 0)
+
+        # Registered email receives a 6-digit code and redirects to /reset-password
+        forgot_res = reset_client.post(
+            "/forgot-password?next=/dashboard",
+            data={"email": "ResetMe@Example.com"},
+        )
+        self.assertEqual(forgot_res.status_code, 302)
+        self.assertEqual(
+            forgot_res.headers["Location"],
+            "/reset-password?email=resetme%40example.com&next=%2Fdashboard",
+        )
+        self.assertEqual(len(sent_codes), 1)
+        reset_code = sent_codes[0][1]
+
+        # Wrong code fails with 400
+        wrong_code = "000000" if reset_code != "000000" else "999999"
+        bad_reset = reset_client.post(
+            "/reset-password?email=resetme@example.com",
+            data={"code": wrong_code, "password": "newstrongpassword456"},
+        )
+        self.assertEqual(bad_reset.status_code, 400)
+        self.assertIn(b"Invalid or expired verification code", bad_reset.data)
+
+        # Valid code updates password, sets new session, and revokes old session
+        good_reset = reset_client.post(
+            "/reset-password?email=resetme@example.com&next=/dashboard",
+            data={"code": reset_code, "password": "newstrongpassword456"},
+        )
+        self.assertEqual(good_reset.status_code, 302)
+        self.assertTrue(good_reset.headers["Location"].endswith("/dashboard"))
+        self.assertIn("olauth_session=", good_reset.headers.get("Set-Cookie", ""))
+        self.assertEqual(reset_client.get("/dashboard").status_code, 200)
+
+        # Old session was revoked
+        self.assertEqual(old_client.get("/dashboard").status_code, 302)
+
+        # Old password fails, new password succeeds
+        login_client = app.test_client()
+        self.assertEqual(
+            login_client.post(
+                "/login",
+                data={"email": "resetme@example.com", "password": "oldpassword123"},
+            ).status_code,
+            401,
+        )
+        self.assertEqual(
+            login_client.post(
+                "/login",
+                data={"email": "resetme@example.com", "password": "newstrongpassword456"},
+            ).status_code,
+            302,
+        )
+
+    def test_flask_custom_templates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            (tmp / "login.html").write_text(
+                "CUSTOM_LOGIN:{{ error }}:{{ email_value }}:{{ forgot_password_url }}",
+                encoding="utf-8",
+            )
+            override_signup = tmp / "override_signup.html"
+            override_signup.write_text(
+                "OVERRIDE_SIGNUP:{{ switch_url }}",
+                encoding="utf-8",
+            )
+
+            app = Flask(__name__)
+            olauth.init(
+                app,
+                db=":memory:",
+                template_dir=tmp,
+                signup_template=override_signup,
+            )
+            client = app.test_client()
+
+            login_html = client.get("/login").data.decode()
+            self.assertIn("CUSTOM_LOGIN:::/forgot-password", login_html)
+
+            bad_login = client.post(
+                "/login",
+                data={"email": "user@example.com", "password": "wrongpassword"},
+            ).data.decode()
+            self.assertIn("CUSTOM_LOGIN:Invalid email or password.:user@example.com:", bad_login)
+
+            signup_html = client.get("/signup").data.decode()
+            self.assertIn("OVERRIDE_SIGNUP:/login", signup_html)
+
+            # Page not present in template_dir falls back to built-in UI
+            forgot_html = client.get("/forgot-password").data.decode()
+            self.assertIn("Reset your password", forgot_html)
 
 
 class FastAPIEngineTests(unittest.TestCase):
@@ -538,6 +682,137 @@ class FastAPIEngineTests(unittest.TestCase):
         dash = client.get("/dashboard")
         self.assertEqual(dash.status_code, 200)
         self.assertEqual(dash.json(), {"verified": "fastverify@example.com"})
+
+    def test_fastapi_password_reset_flow(self):
+        sent_codes = []
+        app = FastAPI()
+        olauth.init(
+            app,
+            db=":memory:",
+            redirect_to="/dashboard",
+            send_verification_code=lambda email, code: sent_codes.append((email, code)),
+        )
+
+        @app.get("/dashboard")
+        def dashboard(user: dict = Depends(olauth.login_required)):
+            return {"email": user["email"]}
+
+        old_client = TestClient(app)
+        self.assertIn('href="/forgot-password"', old_client.get("/login").text)
+
+        # Create & verify user so old_client has an active session
+        old_client.post(
+            "/signup",
+            data={"email": "fastreset@example.com", "password": "oldpassword123"},
+            follow_redirects=False,
+        )
+        signup_code = sent_codes.pop()[1]
+        old_client.post(
+            "/verify?email=fastreset@example.com",
+            data={"code": signup_code},
+            follow_redirects=False,
+        )
+        self.assertEqual(old_client.get("/dashboard").status_code, 200)
+
+        reset_client = TestClient(app)
+        self.assertEqual(reset_client.get("/forgot-password").status_code, 200)
+
+        # HTML forgot-password redirect (303) and JSON response (200)
+        forgot_html = reset_client.post(
+            "/forgot-password?next=/dashboard",
+            data={"email": "fastreset@example.com"},
+            follow_redirects=False,
+        )
+        self.assertEqual(forgot_html.status_code, 303)
+        self.assertEqual(
+            forgot_html.headers["location"],
+            "/reset-password?email=fastreset%40example.com&next=%2Fdashboard",
+        )
+        self.assertEqual(len(sent_codes), 1)
+
+        # Unknown email does not emit a code
+        unknown_json = reset_client.post(
+            "/forgot-password",
+            json={"email": "missing@example.com"},
+            headers={"Accept": "application/json"},
+            follow_redirects=False,
+        )
+        self.assertEqual(unknown_json.status_code, 200)
+        self.assertEqual(len(sent_codes), 1)
+
+        reset_code = sent_codes[0][1]
+
+        # JSON reset-password with valid code sets session cookie and revokes old session
+        good_json_reset = reset_client.post(
+            "/reset-password?next=/dashboard",
+            json={
+                "email": "fastreset@example.com",
+                "code": reset_code,
+                "password": "newstrongpassword456",
+            },
+            headers={"Accept": "application/json"},
+            follow_redirects=False,
+        )
+        self.assertEqual(good_json_reset.status_code, 200)
+        self.assertEqual(good_json_reset.json()["user"]["email"], "fastreset@example.com")
+        self.assertEqual(good_json_reset.json()["redirect_to"], "/dashboard")
+        self.assertIn("olauth_session=", good_json_reset.headers.get("set-cookie", ""))
+        self.assertEqual(reset_client.get("/dashboard").status_code, 200)
+
+        # Old session was revoked
+        self.assertEqual(old_client.get("/dashboard", follow_redirects=False).status_code, 401)
+
+        # Old password rejected, new password accepted
+        login_client = TestClient(app)
+        self.assertEqual(
+            login_client.post(
+                "/login",
+                data={"email": "fastreset@example.com", "password": "oldpassword123"},
+                follow_redirects=False,
+            ).status_code,
+            401,
+        )
+        self.assertEqual(
+            login_client.post(
+                "/login",
+                data={"email": "fastreset@example.com", "password": "newstrongpassword456"},
+                follow_redirects=False,
+            ).status_code,
+            303,
+        )
+
+    def test_fastapi_custom_templates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            (tmp / "login.html").write_text("SHOULD_BE_OVERRIDDEN", encoding="utf-8")
+            (tmp / "signup.html").write_text(
+                "FAST_SIGNUP:{{ error }}:{{ switch_url }}",
+                encoding="utf-8",
+            )
+            override_login = tmp / "custom_login.html"
+            override_login.write_text(
+                "FAST_LOGIN_OVERRIDE:{{ forgot_password_url }}",
+                encoding="utf-8",
+            )
+
+            app = FastAPI()
+            olauth.init(
+                app,
+                db=":memory:",
+                template_dir=tmp,
+                login_template=override_login,
+            )
+            client = TestClient(app)
+
+            login_text = client.get("/login").text
+            self.assertEqual(login_text, "FAST_LOGIN_OVERRIDE:/forgot-password")
+
+            signup_text = client.get("/signup").text
+            self.assertEqual(signup_text, "FAST_SIGNUP::/login")
+
+            # Built-in fallback for pages absent from template_dir
+            reset_text = client.get("/reset-password").text
+            self.assertIn("Set a new password", reset_text)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "olauth"
-version = "1.0.0"
+version = "1.1.0"
 description = "The zero-config, one-liner authentication engine for Python web frameworks."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -18,6 +18,8 @@ from olauth.ui import (
     RateLimiter,
     is_same_origin_post,
     render_auth_page,
+    render_forgot_password_page,
+    render_reset_password_page,
     render_verify_page,
     resolve_redirect_target,
     validate_credentials,
@@ -301,6 +303,158 @@ class DatabaseTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_sqlite_reset_user_password_lifecycle(self):
+        db = DatabaseManager()
+        db.initialize_db(":memory:")
+        try:
+            self.assertTrue(db.create_user("reset@example.com", "old-hash", is_verified=False))
+            user = db.get_user_by_email("reset@example.com")
+            old_session = db.create_session(user["id"], ttl_seconds=3600)
+            self.assertIsNotNone(db.get_user_by_session(old_session))
+
+            code = db.create_verification_code(user["id"], ttl_seconds=600)
+            wrong = "000000" if code != "000000" else "999999"
+            self.assertIsNone(db.reset_user_password("reset@example.com", wrong, "new-hash"))
+            self.assertEqual(db.get_user_by_email("reset@example.com")["password_hash"], "old-hash")
+            self.assertIsNotNone(db.get_user_by_session(old_session))
+
+            updated = db.reset_user_password("reset@example.com", code, "new-hash")
+            self.assertIsNotNone(updated)
+            self.assertEqual(updated["email"], "reset@example.com")
+
+            refreshed = db.get_user_by_email("reset@example.com")
+            self.assertEqual(refreshed["password_hash"], "new-hash")
+            self.assertEqual(refreshed["is_verified"], 1)
+            # Single-use code consumed and prior sessions revoked
+            self.assertIsNone(db.reset_user_password("reset@example.com", code, "newer-hash"))
+            self.assertIsNone(db.get_user_by_session(old_session))
+        finally:
+            db.close()
+
+    def test_postgres_and_mysql_reconnect_on_dropped_connection(self):
+        class FakeIntegrityError(Exception):
+            pass
+
+        class FakeOperationalError(Exception):
+            pass
+
+        shared_sqlite = sqlite3.connect(":memory:")
+        shared_sqlite.execute("PRAGMA foreign_keys=ON;")
+
+        class DroppableCursor:
+            def __init__(self, conn):
+                self.conn = conn
+                self.description = None
+                self.rowcount = 0
+                self._cur = None
+
+            def execute(self, sql, params=()):
+                if self.conn.fail_next_execute:
+                    self.conn.fail_next_execute = False
+                    raise FakeOperationalError("server closed the connection unexpectedly")
+                sqlite_sql = sql.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+                sqlite_sql = sqlite_sql.replace("INT AUTO_INCREMENT PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+                sqlite_sql = sqlite_sql.replace("%s", "?")
+                try:
+                    self._cur = shared_sqlite.execute(sqlite_sql, params)
+                    self.description = self._cur.description
+                    self.rowcount = self._cur.rowcount
+                except sqlite3.IntegrityError as exc:
+                    raise FakeIntegrityError(str(exc)) from exc
+
+            def fetchone(self):
+                return self._cur.fetchone()
+
+            def fetchall(self):
+                return self._cur.fetchall()
+
+            def close(self):
+                pass
+
+        class DroppableConnection:
+            def __init__(self):
+                self.closed = 0
+                self.broken = False
+                self.open = True
+                self.fail_next_execute = False
+
+            def cursor(self):
+                return DroppableCursor(self)
+
+            def commit(self):
+                shared_sqlite.commit()
+
+            def rollback(self):
+                shared_sqlite.rollback()
+
+            def ping(self, reconnect=True):
+                if not self.open:
+                    raise FakeOperationalError("MySQL server has gone away")
+
+            def close(self):
+                self.closed = 1
+                self.open = False
+
+        # PostgreSQL reconnect on closed=1 and on OperationalError mid-query
+        pg_conns = []
+        fake_psycopg = types.ModuleType("psycopg")
+        fake_psycopg.IntegrityError = FakeIntegrityError
+        fake_psycopg.OperationalError = FakeOperationalError
+        fake_psycopg.connect = lambda _url: (pg_conns.append(DroppableConnection()) or pg_conns[-1])
+
+        orig_psycopg = sys.modules.get("psycopg")
+        sys.modules["psycopg"] = fake_psycopg
+        try:
+            pg_db = DatabaseManager()
+            pg_db.initialize_db("postgresql://u:p@localhost/db")
+            self.assertEqual(len(pg_conns), 1)
+            self.assertTrue(pg_db.create_user("pgdrop@example.com", "h1"))
+
+            # Pre-query closed connection reconnects cleanly
+            pg_conns[-1].closed = 1
+            self.assertEqual(pg_db.get_user_by_email("pgdrop@example.com")["email"], "pgdrop@example.com")
+            self.assertEqual(len(pg_conns), 2)
+
+            # Mid-query OperationalError triggers reconnect + retry once
+            pg_conns[-1].fail_next_execute = True
+            self.assertEqual(pg_db.get_user_by_email("pgdrop@example.com")["email"], "pgdrop@example.com")
+            self.assertEqual(len(pg_conns), 3)
+            pg_db.close()
+        finally:
+            if orig_psycopg is None:
+                sys.modules.pop("psycopg", None)
+            else:
+                sys.modules["psycopg"] = orig_psycopg
+
+        # MySQL reconnect on open=False and on OperationalError mid-query
+        my_conns = []
+        fake_pymysql = types.ModuleType("pymysql")
+        fake_pymysql.IntegrityError = FakeIntegrityError
+        fake_pymysql.OperationalError = FakeOperationalError
+        fake_pymysql.connect = lambda **_kw: (my_conns.append(DroppableConnection()) or my_conns[-1])
+
+        orig_pymysql = sys.modules.get("pymysql")
+        sys.modules["pymysql"] = fake_pymysql
+        try:
+            my_db = DatabaseManager()
+            my_db.initialize_db("mysql://u:p@localhost/db")
+            self.assertEqual(len(my_conns), 1)
+
+            my_conns[-1].open = False
+            self.assertEqual(my_db.get_user_by_email("pgdrop@example.com")["email"], "pgdrop@example.com")
+            self.assertEqual(len(my_conns), 2)
+
+            my_conns[-1].fail_next_execute = True
+            self.assertEqual(my_db.get_user_by_email("pgdrop@example.com")["email"], "pgdrop@example.com")
+            self.assertEqual(len(my_conns), 3)
+            my_db.close()
+        finally:
+            if orig_pymysql is None:
+                sys.modules.pop("pymysql", None)
+            else:
+                sys.modules["pymysql"] = orig_pymysql
+            shared_sqlite.close()
+
 
 class UITests(unittest.TestCase):
     def test_render_auth_page_escapes_xss(self):
@@ -330,6 +484,27 @@ class UITests(unittest.TestCase):
         self.assertNotIn('<svg onload="alert(2)">', html_out)
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html_out)
         self.assertIn("&lt;svg onload=&quot;alert(2)&quot;&gt;", html_out)
+
+    def test_render_forgot_and_reset_pages_escape_xss(self):
+        forgot_html = render_forgot_password_page(
+            email_value='"><script>alert(1)</script>',
+            error='<img src=x onerror="alert(2)">',
+            switch_url="/login",
+        )
+        self.assertNotIn("<script>alert(1)</script>", forgot_html)
+        self.assertNotIn('<img src=x onerror="alert(2)">', forgot_html)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", forgot_html)
+        self.assertIn("&lt;img src=x onerror=&quot;alert(2)&quot;&gt;", forgot_html)
+
+        reset_html = render_reset_password_page(
+            email_value='"><script>alert(3)</script>',
+            error='<svg onload="alert(4)">',
+            switch_url="/login",
+        )
+        self.assertNotIn("<script>alert(3)</script>", reset_html)
+        self.assertNotIn('<svg onload="alert(4)">', reset_html)
+        self.assertIn("&lt;script&gt;alert(3)&lt;/script&gt;", reset_html)
+        self.assertIn("&lt;svg onload=&quot;alert(4)&quot;&gt;", reset_html)
 
     def test_validate_credentials(self):
         _, _, err = validate_credentials("not-an-email", "password123")
@@ -429,6 +604,44 @@ class BuiltinSenderTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 auth.init(app, db=":memory:", verify_email=True)
             auth.db.close()
+
+    def test_custom_template_fallback_without_jinja_and_missing_paths(self):
+        import tempfile
+        from pathlib import Path
+        from flask import Flask
+
+        auth = OLAuth()
+        app = Flask(__name__)
+
+        with self.assertRaises(FileNotFoundError):
+            auth.init(app, db=":memory:", template_dir="/nonexistent/olauth/templates")
+        auth.db.close()
+
+        with self.assertRaises(FileNotFoundError):
+            auth.init(app, db=":memory:", login_template="/nonexistent/olauth/login.html")
+        auth.db.close()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tpl = Path(tmpdir) / "login.html"
+            tpl.write_text(
+                "<style>body { color: #111; }</style>"
+                "<h1>{{ heading }}</h1><p>{{ error }}</p><input value='{email_value}'>",
+                encoding="utf-8",
+            )
+            auth.init(app, db=":memory:", template_dir=tmpdir)
+            try:
+                with patch.dict(sys.modules, {"jinja2": None}):
+                    rendered = auth.render_page(
+                        "login",
+                        error='<script>xss</script>',
+                        email_value='a"b@example.com',
+                    )
+                self.assertIn("body { color: #111; }", rendered)
+                self.assertIn("<h1>Log in to your account</h1>", rendered)
+                self.assertIn("&lt;script&gt;xss&lt;/script&gt;", rendered)
+                self.assertIn("a&quot;b@example.com", rendered)
+            finally:
+                auth.db.close()
 
 
 if __name__ == "__main__":

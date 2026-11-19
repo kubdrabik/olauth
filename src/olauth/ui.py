@@ -107,6 +107,7 @@ def render_auth_page(
     error: str = "",
     email_value: str = "",
     password_autocomplete: str = "current-password",
+    forgot_password_url: str | None = None,
 ) -> str:
     """Renders an escaped, self-contained HTML login/signup page with zero template dependencies."""
     fields_html = (
@@ -119,6 +120,13 @@ def render_auth_page(
         f'<input type="password" id="password" name="password" required autocomplete="{html.escape(password_autocomplete, quote=True)}" placeholder="••••••••">'
         '</div>'
     )
+    if forgot_password_url:
+        escaped_forgot_url = html.escape(forgot_password_url, quote=True)
+        fields_html += (
+            '<div style="text-align: right; margin-top: -12px; margin-bottom: 18px; font-size: 13px;">'
+            f'<a href="{escaped_forgot_url}" style="color: var(--text); opacity: 0.75; text-decoration: underline;">Forgot password?</a>'
+            '</div>'
+        )
     return _render_card_shell(
         title=title,
         heading=heading,
@@ -132,20 +140,20 @@ def render_auth_page(
     )
 
 
-def render_verify_page(
+def _build_email_and_code_fields(
+    email_value: str,
     *,
-    email_value: str = "",
-    switch_url: str = "/login",
-    error: str = "",
-) -> str:
-    """Renders an escaped 6-digit email verification code page."""
+    present_subtitle: str,
+    missing_subtitle: str,
+) -> tuple[str, str]:
+    """Builds the subtitle and email + 6-digit code fields shared by verify and reset pages."""
     cleaned_email = email_value.strip() if isinstance(email_value, str) else ""
     if cleaned_email:
         escaped_email = html.escape(cleaned_email, quote=True)
-        subtitle_html = f"Enter the 6-digit verification code sent to <strong>{escaped_email}</strong>."
+        subtitle_html = present_subtitle.format(email=escaped_email)
         email_field = f'<input type="hidden" name="email" value="{escaped_email}">'
     else:
-        subtitle_html = "Enter your email address and 6-digit verification code."
+        subtitle_html = missing_subtitle
         email_field = (
             '<div class="field">'
             '<label for="email">Email address</label>'
@@ -160,12 +168,84 @@ def render_verify_page(
         'maxlength="6" autocomplete="one-time-code" required placeholder="123456">'
         '</div>'
     )
+    return subtitle_html, email_field + code_field
+
+
+def render_verify_page(
+    *,
+    email_value: str = "",
+    switch_url: str = "/login",
+    error: str = "",
+) -> str:
+    """Renders an escaped 6-digit email verification code page."""
+    subtitle_html, fields_html = _build_email_and_code_fields(
+        email_value,
+        present_subtitle="Enter the 6-digit verification code sent to <strong>{email}</strong>.",
+        missing_subtitle="Enter your email address and 6-digit verification code.",
+    )
     return _render_card_shell(
         title="Verify your email",
         heading="Verify your email",
         subtitle_html=subtitle_html,
-        fields_html=email_field + code_field,
+        fields_html=fields_html,
         button_text="Verify email",
+        switch_prompt="Back to",
+        switch_url=switch_url,
+        switch_action="Log in",
+        error=error,
+    )
+
+
+def render_forgot_password_page(
+    *,
+    email_value: str = "",
+    switch_url: str = "/login",
+    error: str = "",
+) -> str:
+    """Renders an escaped password reset request page."""
+    fields_html = (
+        '<div class="field">'
+        '<label for="email">Email address</label>'
+        f'<input type="email" id="email" name="email" required autocomplete="email" placeholder="you@example.com" value="{html.escape(email_value, quote=True)}">'
+        '</div>'
+    )
+    return _render_card_shell(
+        title="Reset your password",
+        heading="Reset your password",
+        subtitle_html="Enter your email address and we'll send you a 6-digit verification code.",
+        fields_html=fields_html,
+        button_text="Send reset code",
+        switch_prompt="Remembered your password?",
+        switch_url=switch_url,
+        switch_action="Log in",
+        error=error,
+    )
+
+
+def render_reset_password_page(
+    *,
+    email_value: str = "",
+    switch_url: str = "/login",
+    error: str = "",
+) -> str:
+    """Renders an escaped password reset code and new password page."""
+    subtitle_html, fields_html = _build_email_and_code_fields(
+        email_value,
+        present_subtitle="Enter the 6-digit reset code sent to <strong>{email}</strong> and choose a new password.",
+        missing_subtitle="Enter your email address, 6-digit reset code, and new password.",
+    )
+    fields_html += (
+        '<div class="field">'
+        '<label for="password">New password</label>'
+        '<input type="password" id="password" name="password" required autocomplete="new-password" placeholder="••••••••">'
+        '</div>'
+    )
+    return _render_card_shell(
+        title="Set a new password",
+        heading="Set a new password",
+        subtitle_html=subtitle_html,
+        fields_html=fields_html,
+        button_text="Reset password",
         switch_prompt="Back to",
         switch_url=switch_url,
         switch_action="Log in",
