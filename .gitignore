@@ -15,7 +15,11 @@ dist/
 
 # Local Databases (Crucial for security!)
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Environment Variables / Private Keys
 .env

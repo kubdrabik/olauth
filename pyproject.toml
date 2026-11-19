@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "olauth"
-version = "0.1.0a1"
+version = "1.0.0"
 description = "The zero-config, one-liner authentication engine for Python web frameworks."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,13 @@ classifiers = [
 dependencies = [
     "bcrypt>=4.0.0",
 ]
+
+[project.optional-dependencies]
+flask = ["flask>=2.0.0"]
+fastapi = ["fastapi>=0.100.0"]
+postgres = ["psycopg2-binary>=2.9.0"]
+mysql = ["pymysql>=1.1.0"]
+dev = ["pytest>=7.0.0", "flask>=2.0.0", "fastapi>=0.100.0", "httpx>=0.24.0"]
 
 # This tells Hatch exactly where your package source files live
 [tool.hatch.build.targets.wheel]
